@@ -14,6 +14,7 @@ def test_public_exports_are_available():
         "TTSCacheMixin",
         "CacheBackend",
         "MemoryCacheBackend",
+        "DiskCacheBackend",
         "RedisCacheBackend",
         "REDIS_AVAILABLE",
         "CachedAudioChunk",

@@ -21,6 +21,7 @@
 ## 🚀 Key Features
 
 - **Ultra-Low Latency** – Delivers cached audio in ~0.1ms (Memory) or ~1-5ms (Redis).
+- **Local Persistence** – Disk backend keeps cached responses across process/server restarts, without Redis.
 - **Cost Reduction** – Stop paying your TTS provider for common phrases like "Hello," "One moment," or "I didn't catch that."
 - **Universal Compatibility** – Works as a Mixin with **all** Pipecat TTS services (Cartesia, ElevenLabs, Deepgram, Google, etc.).
 - **Smart Interruption** – Automatically clears pending cache tasks and resets state when users interrupt the bot.
@@ -29,7 +30,7 @@
 ## 📦 Installation
 
 ```bash
-# Standard installation (Memory backend only)
+# Standard installation (Memory and Disk backends)
 pip install pipecat-tts-cache
 
 # Production installation (with Redis support)
@@ -105,6 +106,68 @@ tts = CachedGoogleTTS(
 > sessions (recommended for Redis, so its connection pool is shared) and call
 > `await backend.close()` when your app shuts down. The package never closes an injected
 > backend, so a shared one is safe.
+
+### 3. Persistent Disk Cache (Single Server)
+
+`DiskCacheBackend` implements the same `CacheBackend` interface, with no extra dependencies.
+Pass it to your existing cached service (the `CachedGoogleTTS` class from above):
+
+```python
+from pipecat_tts_cache import DiskCacheBackend
+
+backend = DiskCacheBackend(cache_dir="/var/cache/my-bot/tts")
+tts = CachedGoogleTTS(
+    settings=CachedGoogleTTS.Settings(voice="en-US-Chirp3-HD-Charon"),
+    cache_backend=backend,
+    cache_namespace="my-bot",  # Stable across sessions/restarts
+    cache_ttl=86400,
+)
+# Keep tts in your existing Pipecat pipeline, before transport.output().
+# At application shutdown:
+# await backend.close()  # Preserves disk entries
+```
+
+Use a writable, dedicated local directory; it is created on the first write. Reuse the
+same directory, namespace, provider/settings and text after restarting to hit the cache.
+Relative paths resolve at construction; an absolute path avoids dependence on the working
+directory. Container deployments need a persistent mounted volume.
+
+- **Payload:** the existing `CachedTTSResponse` fields, including chunks, audio format,
+  word timestamps, creation time and metadata, stored as versioned JSON with Base64 audio
+  and a SHA-256 integrity checksum. Metadata must be JSON-compatible; unsupported values
+  cause `set()` to return `False`. No pickle, database, Pipecat frame or service serialization.
+  The mixin supplies text/audio metadata, not credentials; custom callers must not put
+  secrets in response metadata or keys. Replay creates fresh frames in the current context.
+- **TTL:** absolute expiration time survives restarts. `None`, zero and negative TTL mean
+  no expiry, matching Memory/Redis. Reads do not extend TTL. Expired, corrupt, unsupported
+  or unreadable entries return a miss; write failures return `False` so synthesis continues.
+- **Writes:** file I/O runs off the event loop. Owner-only temporary files are flushed and
+  fsynced, then atomically replaced in the same directory. Readers see complete old/new
+  entries; concurrent writers use last-replacement-wins semantics. Intended for local
+  filesystems, not network shares; this is not a power-loss durability guarantee.
+- **Maintenance:** `delete(key)`, `clear()` and `clear(namespace)` work as on other backends.
+  Expired/corrupt files remain until overwritten or explicitly removed, avoiding deletion
+  races with new writes. Namespace clear skips corrupt files it cannot attribute safely;
+  unscoped clear removes them. There is no automatic size eviction. Stats `size` counts
+  entry files (including expired/corrupt ones); hit/miss counters reset per instance.
+  Clear during concurrent writes is best-effort, as with Redis. An abruptly killed writer
+  may leave an ignored `.tts-cache-*.tmp` file; remove these only when writers are stopped.
+
+**Manual check (`miss → hit → restart → hit`):** with the existing example credentials
+configured, set `USE_REDIS_CACHE=false` and `DISK_CACHE_DIR=/absolute/path/to/tts-cache`,
+then run `examples/basic_caching.py` as below. Use an empty directory for the first run.
+Let the intro finish, ask “please repeat that”, and check the `Cache miss` / `Cache hit`
+logs. Stop and restart the server with the same environment; the identical intro should
+now log `Cache hit`. Keep the same voice/settings and finish within the example's 1-hour TTL.
+
+For a storage-only check without provider credentials, run twice:
+
+```bash
+uv run python examples/disk_persistence.py /absolute/path/to/empty-cache
+# First process: miss -> stored -> hit
+uv run python examples/disk_persistence.py /absolute/path/to/empty-cache
+# New process: hit -> hit
+```
 
 ## 🧠 How It Works
 

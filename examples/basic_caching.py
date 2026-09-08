@@ -52,7 +52,7 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
 
-from pipecat_tts_cache import MemoryCacheBackend, TTSCacheMixin
+from pipecat_tts_cache import DiskCacheBackend, MemoryCacheBackend, TTSCacheMixin
 
 load_dotenv(override=True)
 
@@ -100,6 +100,11 @@ def create_cache_backend():
             )
         except ImportError:
             logger.warning("Redis not available, falling back to memory cache")
+
+    disk_cache_dir = os.getenv("DISK_CACHE_DIR")
+    if disk_cache_dir:
+        logger.info(f"Using disk cache backend: {disk_cache_dir}")
+        return DiskCacheBackend(cache_dir=disk_cache_dir)
 
     logger.info("Using in-memory cache backend (max_size=100)")
     return MemoryCacheBackend(max_size=100)

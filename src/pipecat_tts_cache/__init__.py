@@ -9,6 +9,7 @@
 from pipecat_tts_cache.backends import (
     REDIS_AVAILABLE,
     CacheBackend,
+    DiskCacheBackend,
     MemoryCacheBackend,
     RedisCacheBackend,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "TTSCacheMixin",
     "CacheBackend",
     "MemoryCacheBackend",
+    "DiskCacheBackend",
     "RedisCacheBackend",
     "REDIS_AVAILABLE",
     "CachedAudioChunk",

@@ -7,6 +7,7 @@
 """Cache backend implementations for TTS caching."""
 
 from pipecat_tts_cache.backends.base import CacheBackend
+from pipecat_tts_cache.backends.disk import DiskCacheBackend
 from pipecat_tts_cache.backends.memory import MemoryCacheBackend
 
 try:
@@ -20,6 +21,7 @@ except ImportError:
 __all__ = [
     "CacheBackend",
     "MemoryCacheBackend",
+    "DiskCacheBackend",
     "RedisCacheBackend",
     "REDIS_AVAILABLE",
 ]

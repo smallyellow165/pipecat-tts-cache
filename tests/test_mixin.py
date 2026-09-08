@@ -7,7 +7,7 @@
 """End-to-end behavior of ``TTSCacheMixin`` against a real Pipecat 1.5.0 pipeline.
 
 Tests drive frames through ``run_test`` (Pipecat's own pipeline test harness) with a
-real ``TTSService`` subclass fake and a real ``MemoryCacheBackend`` — no mocking of the
+real ``TTSService`` subclass fake and real Memory/Disk backends — no mocking of the
 cache or the framework. The fakes mirror the two real delivery models:
 
 - HTTP-style: ``run_tts`` yields audio synchronously.
@@ -17,6 +17,7 @@ cache or the framework. The fakes mirror the two real delivery models:
 import asyncio
 from collections.abc import AsyncGenerator
 
+import pytest
 from pipecat.frames.frames import (
     Frame,
     InterruptionFrame,
@@ -30,7 +31,7 @@ from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService
 from pipecat.tests.utils import SleepFrame, run_test
 
-from pipecat_tts_cache import CacheBackend, MemoryCacheBackend, TTSCacheMixin
+from pipecat_tts_cache import CacheBackend, DiskCacheBackend, MemoryCacheBackend, TTSCacheMixin
 
 _AUDIO = b"\x00\x01" * 320  # 640 bytes of 16-bit PCM
 _SAMPLE_RATE = 16000
@@ -119,9 +120,16 @@ def _speak(text: str) -> TTSSpeakFrame:
     return TTSSpeakFrame(text=text, append_to_context=False)
 
 
-async def test_cache_miss_synthesizes_and_stores():
+@pytest.fixture(params=["memory", "disk"])
+def cache_backend(request, tmp_path):
+    if request.param == "disk":
+        return DiskCacheBackend(tmp_path / "tts")
+    return MemoryCacheBackend()
+
+
+async def test_cache_miss_synthesizes_and_stores(cache_backend):
     """A first request is a miss: it synthesizes, emits audio, and populates the cache."""
-    backend = MemoryCacheBackend()
+    backend = cache_backend
     tts = CachedHttpTTS(cache_backend=backend)
 
     down, _ = await run_test(tts, frames_to_send=[_speak("hello world")])
@@ -132,9 +140,9 @@ async def test_cache_miss_synthesizes_and_stores():
     assert (await backend.get_stats())["size"] == 1  # one entry stored
 
 
-async def test_cache_hit_replays_without_resynthesizing():
+async def test_cache_hit_replays_without_resynthesizing(cache_backend):
     """A repeated request within the session hits cache: audio replays, provider not called again."""
-    backend = MemoryCacheBackend()
+    backend = cache_backend
     tts = CachedHttpTTS(cache_backend=backend)
 
     down, _ = await run_test(
@@ -155,9 +163,9 @@ async def test_cache_hit_replays_without_resynthesizing():
     assert stats["misses"] == 1
 
 
-async def test_distinct_texts_do_not_collide():
+async def test_distinct_texts_do_not_collide(cache_backend):
     """Different texts are cached independently; both are synthesized."""
-    backend = MemoryCacheBackend()
+    backend = cache_backend
     tts = CachedHttpTTS(cache_backend=backend)
 
     await run_test(
@@ -174,9 +182,9 @@ async def test_distinct_texts_do_not_collide():
     assert (await backend.get_stats())["size"] == 2
 
 
-async def test_word_timestamps_preserved_on_cache_hit():
+async def test_word_timestamps_preserved_on_cache_hit(cache_backend):
     """Word timestamps are cached and replayed, so transcripts survive a hit (GitHub #6)."""
-    backend = MemoryCacheBackend()
+    backend = cache_backend
     tts = CachedWordTTS(cache_backend=backend)
 
     down, _ = await run_test(
@@ -213,9 +221,9 @@ async def test_disabled_cache_is_a_transparent_passthrough():
     assert len(audio) == 2
 
 
-async def test_websocket_audio_is_captured_and_replayed():
+async def test_websocket_audio_is_captured_and_replayed(cache_backend):
     """Async (websocket-style) audio is captured via push_frame and replayed on hit."""
-    backend = MemoryCacheBackend()
+    backend = cache_backend
     tts = CachedSlowWsTTS(cache_backend=backend)
 
     down, _ = await run_test(
@@ -233,11 +241,11 @@ async def test_websocket_audio_is_captured_and_replayed():
     assert len(audio) == 2
 
 
-async def test_cache_hit_audio_stays_in_its_own_bracket():
+async def test_cache_hit_audio_stays_in_its_own_bracket(cache_backend):
     """GitHub #2: replayed audio must flow through the audio context in order, not
     interleave. Each request (live or cached) forms a clean Started -> Audio -> Stopped
     group; the cached group must not bleed into the live one."""
-    backend = MemoryCacheBackend()
+    backend = cache_backend
     tts = CachedHttpTTS(cache_backend=backend)
 
     down, _ = await run_test(
@@ -264,11 +272,11 @@ async def test_cache_hit_audio_stays_in_its_own_bracket():
     ]
 
 
-async def test_interruption_discards_pending_capture():
+async def test_interruption_discards_pending_capture(cache_backend):
     """An interruption discards the in-flight capture context so interrupted audio is
     never cached. Asserting ``_contexts`` (not just backend size) gives the test teeth:
     it fails if the mixin ever stops clearing capture state on interruption."""
-    backend = MemoryCacheBackend()
+    backend = cache_backend
     tts = CachedSlowWsTTS(cache_backend=backend)
 
     await run_test(
@@ -285,9 +293,9 @@ async def test_interruption_discards_pending_capture():
     assert (await backend.get_stats())["size"] == 0  # nothing interrupted was cached
 
 
-async def test_clear_cache_removes_stored_entries():
+async def test_clear_cache_removes_stored_entries(cache_backend):
     """The public clear_cache() empties the backend."""
-    backend = MemoryCacheBackend()
+    backend = cache_backend
     tts = CachedHttpTTS(cache_backend=backend)
 
     await run_test(
@@ -621,3 +629,32 @@ async def test_add_word_timestamps_adapts_to_an_older_base_signature():
         [("hi", 0.0)], context_id="c", includes_inter_frame_spaces=True, pre_merge_tokens=True
     )
     assert received == [([("hi", 0.0)], "c")]
+
+
+@pytest.mark.parametrize("service", [CachedHttpTTS, CachedWordTTS, CachedSlowWsTTS])
+async def test_disk_reopen_replays_with_fresh_frame_and_context_identity(tmp_path, service):
+    first_backend = DiskCacheBackend(tmp_path)
+    first = service(cache_backend=first_backend)
+    live, _ = await run_test(first, frames_to_send=[_speak("hello world")])
+    assert first.run_tts_calls == 1
+    assert (await first_backend.get_stats())["size"] == 1
+    await first_backend.close()
+
+    # A new backend and service represent an entirely new server session.
+    second = service(cache_backend=DiskCacheBackend(tmp_path))
+    replay, _ = await run_test(second, frames_to_send=[_speak("hello world")])
+    assert second.run_tts_calls == 0
+    assert (await second.get_cache_stats())["hits"] == 1
+    old_audio = [f for f in live if isinstance(f, TTSAudioRawFrame)]
+    new_audio = [f for f in replay if isinstance(f, TTSAudioRawFrame)]
+    assert [f.audio for f in new_audio] == [f.audio for f in old_audio]
+    assert new_audio[0].context_id != old_audio[0].context_id
+    assert new_audio[0].id != old_audio[0].id
+    assert [f.text for f in replay if isinstance(f, TTSTextFrame)] == [
+        f.text for f in live if isinstance(f, TTSTextFrame)
+    ]
+    lifecycle = [
+        f for f in replay if isinstance(f, (TTSStartedFrame, TTSAudioRawFrame, TTSStoppedFrame))
+    ]
+    assert [type(f) for f in lifecycle] == [TTSStartedFrame, TTSAudioRawFrame, TTSStoppedFrame]
+    assert all(f.context_id == new_audio[0].context_id for f in lifecycle)
